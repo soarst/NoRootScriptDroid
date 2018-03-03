@@ -1,40 +1,38 @@
 package com.stardust.scriptdroid.ui.common;
 
-import android.app.Activity;
-import android.app.Dialog;
 import android.content.Context;
-import android.content.ContextWrapper;
 import android.os.Looper;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.support.design.widget.Snackbar;
 import android.text.InputType;
 import android.view.View;
-import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.Toast;
 
 import com.afollestad.materialdialogs.DialogAction;
 import com.afollestad.materialdialogs.MaterialDialog;
-import com.jecelyin.common.utils.L;
 import com.stardust.app.DialogUtils;
-import com.stardust.autojs.runtime.api.ui.Dialogs;
 import com.stardust.pio.PFile;
 import com.stardust.pio.UncheckedIOException;
 import com.stardust.scriptdroid.App;
 import com.stardust.scriptdroid.R;
 import com.stardust.scriptdroid.script.ScriptFile;
 import com.stardust.scriptdroid.script.Scripts;
-import com.stardust.scriptdroid.script.StorageScriptProvider;
+import com.stardust.scriptdroid.script.StorageFileProvider;
 import com.stardust.scriptdroid.script.sample.Sample;
-import com.stardust.scriptdroid.ui.main.script_list.MyScriptListFragment;
+import com.stardust.scriptdroid.ui.main.scripts.MyScriptListFragment;
 import com.stardust.theme.dialog.ThemeColorMaterialDialogBuilder;
+
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
 
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 
 import io.reactivex.Observable;
+import io.reactivex.android.schedulers.AndroidSchedulers;
 import io.reactivex.functions.Consumer;
 import io.reactivex.functions.Function;
 import io.reactivex.schedulers.Schedulers;
@@ -49,15 +47,17 @@ public class ScriptOperations {
     private Context mContext;
     private View mView;
     private ScriptFile mCurrentDirectory;
+    private StorageFileProvider mStorageFileProvider;
 
     public ScriptOperations(Context context, View view, ScriptFile currentDirectory) {
         mContext = context;
         mView = view;
         mCurrentDirectory = currentDirectory;
+        mStorageFileProvider = StorageFileProvider.getDefault();
     }
 
     public ScriptOperations(Context context, View view) {
-        this(context, view, MyScriptListFragment.getCurrentDirectory());
+        this(context, view, StorageFileProvider.DEFAULT_DIRECTORY);
     }
 
     public void newScriptFileForScript(final String script) {
@@ -85,9 +85,10 @@ public class ScriptOperations {
                     PFile.write(path, script);
                 } catch (UncheckedIOException e) {
                     showMessage(R.string.text_file_write_fail);
+                    return;
                 }
             }
-            notifyScriptFileChanged();
+            mStorageFileProvider.notifyFileCreated(mCurrentDirectory, new ScriptFile(path));
             if (edit)
                 Scripts.edit(path);
         } else {
@@ -117,7 +118,7 @@ public class ScriptOperations {
                         } else {
                             showMessage(R.string.text_import_fail);
                         }
-                        notifyScriptFileChanged();
+                        mStorageFileProvider.notifyFileCreated(mCurrentDirectory, new ScriptFile(pathTo));
                         return pathTo;
                     }
                 });
@@ -135,7 +136,7 @@ public class ScriptOperations {
                         } else {
                             showMessage(R.string.text_import_fail);
                         }
-                        notifyScriptFileChanged();
+                        mStorageFileProvider.notifyFileCreated(mCurrentDirectory, new ScriptFile(pathTo));
                         return pathTo;
                     }
                 });
@@ -149,7 +150,7 @@ public class ScriptOperations {
                     public void accept(@io.reactivex.annotations.NonNull String path) throws Exception {
                         if (new ScriptFile(getCurrentDirectory(), path).mkdirs()) {
                             showMessage(R.string.text_already_create);
-                            notifyScriptFileChanged();
+                            mStorageFileProvider.notifyFileCreated(mCurrentDirectory, new ScriptFile(path));
                         } else {
                             showMessage(R.string.text_create_fail);
                         }
@@ -157,23 +158,20 @@ public class ScriptOperations {
                 });
     }
 
-    private void notifyScriptFileChanged() {
-        StorageScriptProvider.getDefault().notifyDirectoryChanged(mCurrentDirectory);
-    }
-
     private void showMessage(final int resId) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            showMessageDirectly(resId);
+            showMessageWithoutThreadSwitch(resId);
         }
+        //switch to ui thread to show message
         App.getApp().getUiHandler().post(new Runnable() {
             @Override
             public void run() {
-                showMessageDirectly(resId);
+                showMessageWithoutThreadSwitch(resId);
             }
         });
     }
 
-    private void showMessageDirectly(int resId) {
+    private void showMessageWithoutThreadSwitch(int resId) {
         if (mView != null) {
             Snackbar.make(mView, resId, Snackbar.LENGTH_SHORT).show();
         } else {
@@ -219,16 +217,45 @@ public class ScriptOperations {
     }
 
     public Observable<Boolean> rename(final ScriptFile file) {
+        final ScriptFile oldFile = new ScriptFile(file.getPath());
         String originalName = file.getSimplifiedName();
         return showNameInputDialog(originalName, new InputCallback(file.isDirectory() ? null : PFile.getExtension(file.getName()),
                 originalName))
                 .map(new Function<String, Boolean>() {
                     @Override
                     public Boolean apply(@io.reactivex.annotations.NonNull String newName) throws Exception {
-                        return file.renameTo(newName);
+                        ScriptFile newFile = file.renameAndReturnNewFile(newName);
+                        if (newFile != null) {
+                            mStorageFileProvider.notifyFileChanged(mCurrentDirectory, oldFile, newFile);
+                        }
+                        return newFile != null;
                     }
                 });
     }
+
+    public void createShortcut(ScriptFile file) {
+        Scripts.createShortcut(file);
+        showMessage(R.string.text_already_create);
+    }
+
+    public void delete(final ScriptFile scriptFile) {
+        Observable.fromPublisher(new Publisher<Boolean>() {
+            @Override
+            public void subscribe(Subscriber<? super Boolean> s) {
+                s.onNext(PFile.deleteRecursively(scriptFile));
+            }
+        }).subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(new Consumer<Boolean>() {
+                    @Override
+                    public void accept(@io.reactivex.annotations.NonNull Boolean deleted) throws Exception {
+                        showMessage(deleted ? R.string.text_already_delete : R.string.text_delete_failed);
+                        if (deleted)
+                            mStorageFileProvider.notifyFileRemoved(mCurrentDirectory, scriptFile);
+                    }
+                });
+    }
+
 
     private class InputCallback implements MaterialDialog.InputCallback {
 
